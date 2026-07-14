@@ -1,0 +1,6 @@
+{
+  "name": "School Events Board",
+  "description": "A responsive school events platform with student registration, event submissions, image upload with preview, and a full admin approval dashboard. Includes a downloadable PHP/MySQL package for offline XAMPP/WAMP deployment.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
