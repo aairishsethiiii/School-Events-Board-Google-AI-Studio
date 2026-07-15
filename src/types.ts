@@ -6,6 +6,7 @@ export interface Student {
   section: string;
   admissionNumber: string;
   createdAt: string;
+  password?: string;
 }
 
 export type EventStatus = 'Pending' | 'Approved' | 'Rejected';

@@ -57,6 +57,11 @@
   100% { transform: translateX(-50%); }
 }
 
+@keyframes marquee-ltr {
+  0% { transform: translateX(-50%); }
+  100% { transform: translateX(0); }
+}
+
 .animate-pulse-slow {
   animation: pulse-slow 4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }
@@ -69,5 +74,47 @@
 
 .animate-marquee:hover {
   animation-play-state: paused;
+}
+
+/* LTR Marquee custom CSS */
+.marquee-container {
+  width: 100%;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.marquee-container::-webkit-scrollbar {
+  display: none;
+}
+
+.marquee-track {
+  display: flex;
+  gap: 2rem;
+  width: max-content;
+}
+
+.animate-marquee-ltr {
+  display: inline-flex;
+  animation: marquee-ltr 30s linear infinite;
+}
+
+.marquee-container:hover .animate-marquee-ltr,
+.marquee-container:focus-within .animate-marquee-ltr,
+.marquee-container:active .animate-marquee-ltr {
+  animation-play-state: paused;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .marquee-container {
+    overflow-x: auto;
+  }
+  .animate-marquee-ltr {
+    animation: none !important;
+    transform: none !important;
+  }
+  .marquee-duplicate-track {
+    display: none !important;
+  }
 }
 

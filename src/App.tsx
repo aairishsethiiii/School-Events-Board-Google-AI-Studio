@@ -28,10 +28,12 @@ import {
   Info,
   Settings,
   Activity,
-  UserPlus
+  UserPlus,
+  Database
 } from 'lucide-react';
 import { Student, SchoolEvent, ActivePage, Toast, EventStatus, AuditLog, SystemSettings } from './types';
 import { PHP_FILES_DATA, PHPFileItem } from './phpFilesData';
+import { supabase, SUPABASE_SQL_SETUP } from './supabase';
 
 // Initial Mock Data to seed the application so it opens beautifully right away!
 const INITIAL_STUDENTS: Student[] = [
@@ -118,6 +120,26 @@ const INITIAL_SETTINGS: SystemSettings = {
   tickerMessage: 'Welcome to the Campus Announcement Board. Log in as a student to propose class agendas, arts galas, and athletic championships!'
 };
 
+const getRepeatedEvents = (eventsList: SchoolEvent[]) => {
+  if (eventsList.length === 0) return [];
+  let list = [...eventsList];
+  while (list.length < 6) {
+    list = [...list, ...eventsList];
+  }
+  return list;
+};
+
+const hashPassword = async (pwd: string): Promise<string> => {
+  const msgBuffer = new TextEncoder().encode(pwd);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+};
+
+const isSHA256 = (str: string): boolean => {
+  return /^[a-f0-9]{64}$/i.test(str);
+};
+
 export default function App() {
   // --- DATABASE EMULATION (LOCAL STORAGE STATE) ---
   const [students, setStudents] = useState<Student[]>(() => {
@@ -143,6 +165,171 @@ export default function App() {
     const saved = localStorage.getItem('active_page') as ActivePage;
     return saved || 'Home';
   });
+
+  // --- SUPABASE STATE & SYNCHRONIZATION ---
+  const [supabaseStatus, setSupabaseStatus] = useState<'connected' | 'disconnected' | 'connecting' | 'missing_tables'>('connecting');
+
+  const checkSupabaseConnection = async (quiet = false) => {
+    try {
+      if (!quiet) setSupabaseStatus('connecting');
+      
+      // 1. Check students table
+      const { data: dbStudents, error: studentsError } = await supabase
+        .from('students')
+        .select('*');
+
+      if (studentsError) {
+        console.warn('Supabase connection check failed (expected if database is offline/paused):', studentsError);
+        if (studentsError.code === '42P01' || studentsError.message?.includes('does not exist')) {
+          setSupabaseStatus('missing_tables');
+          return false;
+        }
+        setSupabaseStatus('disconnected');
+        return false;
+      }
+
+      // 2. Check events table
+      const { data: dbEvents, error: eventsError } = await supabase
+        .from('events')
+        .select('*');
+
+      if (eventsError) {
+        console.warn('Supabase connection check failed on events:', eventsError);
+        setSupabaseStatus('disconnected');
+        return false;
+      }
+
+      setSupabaseStatus('connected');
+
+      // Map students to local state
+      if (dbStudents && dbStudents.length > 0) {
+        const mappedStudents: Student[] = [];
+        for (const s of dbStudents) {
+          let currentPwd = s.password || 'password123';
+          if (!isSHA256(currentPwd)) {
+            const hashed = await hashPassword(currentPwd);
+            try {
+              await supabase
+                .from('students')
+                .update({ password: hashed })
+                .eq('id', s.id);
+            } catch (err) {
+              console.warn('Error hashing existing student password in Supabase:', err);
+            }
+            currentPwd = hashed;
+          }
+          mappedStudents.push({
+            id: s.id,
+            fullName: s.full_name,
+            email: s.email,
+            class: s.class,
+            section: s.section,
+            admissionNumber: s.admission_number,
+            password: currentPwd,
+            createdAt: s.created_at
+          });
+        }
+        setStudents(mappedStudents);
+      }
+
+      // Map events to local state
+      if (dbEvents && dbEvents.length > 0) {
+        const mappedEvents: SchoolEvent[] = dbEvents.map((e: any) => ({
+          id: e.id,
+          studentId: e.student_id,
+          studentName: e.student_name,
+          title: e.title,
+          description: e.description,
+          category: e.category,
+          eventDate: e.event_date,
+          image: e.image || '',
+          status: e.status as EventStatus,
+          createdAt: e.created_at,
+          rejectionReason: e.rejection_reason || undefined
+        }));
+        // Sort by createdAt descending
+        mappedEvents.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        setEvents(mappedEvents);
+      }
+      return true;
+    } catch (err) {
+      console.warn('Supabase check error:', err);
+      setSupabaseStatus('disconnected');
+      return false;
+    }
+  };
+
+  useEffect(() => {
+    checkSupabaseConnection(true);
+  }, []);
+
+  const syncLocalToSupabase = async () => {
+    try {
+      setSupabaseStatus('connecting');
+      addAuditLog('Starting manual sync to Supabase...', 'info');
+
+      // 1. Sync students
+      for (const student of students) {
+        let pwdToSync = student.password || 'password123';
+        if (!isSHA256(pwdToSync)) {
+          pwdToSync = await hashPassword(pwdToSync);
+        }
+        const { error } = await supabase
+          .from('students')
+          .upsert({
+            id: student.id,
+            full_name: student.fullName,
+            email: student.email,
+            class: student.class,
+            section: student.section,
+            admission_number: student.admissionNumber,
+            password: pwdToSync,
+            created_at: student.createdAt
+          });
+        if (error) throw error;
+      }
+
+      // 2. Sync events
+      for (const event of events) {
+        const { error } = await supabase
+          .from('events')
+          .upsert({
+            id: event.id,
+            student_id: event.studentId,
+            student_name: event.studentName,
+            title: event.title,
+            description: event.description,
+            category: event.category,
+            event_date: event.eventDate,
+            image: event.image,
+            status: event.status,
+            rejection_reason: event.rejectionReason || null,
+            created_at: event.createdAt
+          });
+        if (error) throw error;
+      }
+
+      // 3. Sync default admin login credentials
+      const { error: adminError } = await supabase
+        .from('admins')
+        .upsert({
+          id: 'admin-1',
+          username: 'admin',
+          password: 'admin123',
+          created_at: new Date().toISOString()
+        });
+      if (adminError) throw adminError;
+
+      setSupabaseStatus('connected');
+      showToast('All local storage data successfully push-synchronized with Supabase cloud tables!', 'success');
+      addAuditLog('Pushed offline dataset to online Supabase tables', 'success');
+      checkSupabaseConnection(true);
+    } catch (err: any) {
+      console.error('Supabase sync push failed:', err);
+      showToast(`Sync Failed: ${err.message || 'Unknown error'}`, 'error');
+      setSupabaseStatus('disconnected');
+    }
+  };
 
   // Persist State Updates
   useEffect(() => {
@@ -231,6 +418,8 @@ export default function App() {
   const [rejectEventId, setRejectEventId] = useState<string | null>(null);
   const [rejectionInput, setRejectionInput] = useState('');
   const [detailEvent, setDetailEvent] = useState<SchoolEvent | null>(null);
+  const [inspectRejectMode, setInspectRejectMode] = useState(false);
+  const [inspectRejectReason, setInspectRejectReason] = useState('');
   const [adminStudentSearch, setAdminStudentSearch] = useState('');
   const [adminEventSearch, setAdminEventSearch] = useState('');
   const [adminEventCategoryFilter, setAdminEventCategoryFilter] = useState('');
@@ -283,7 +472,7 @@ export default function App() {
   // --- HANDLERS ---
 
   // Student Sign Up
-  const handleSignUpSubmit = (e: React.FormEvent) => {
+  const handleSignUpSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const { fullName, email, class: stClass, section, admissionNumber, password, confirmPassword } = signUpData;
 
@@ -310,28 +499,86 @@ export default function App() {
     }
 
     // Check existing
-    const emailExists = students.some((s) => s.email.toLowerCase() === email.toLowerCase());
-    if (emailExists) {
-      showToast('Email address is already registered.', 'error');
-      return;
-    }
+    if (supabaseStatus === 'connected') {
+      try {
+        const { data: existingEmail, error: emailError } = await supabase
+          .from('students')
+          .select('email')
+          .eq('email', email)
+          .maybeSingle();
 
-    const admExists = students.some((s) => s.admissionNumber.toUpperCase() === admissionNumber.toUpperCase());
-    if (admExists) {
-      showToast('Admission number is already registered.', 'error');
-      return;
+        if (emailError) throw emailError;
+        if (existingEmail) {
+          showToast('Email address is already registered in cloud database.', 'error');
+          return;
+        }
+
+        const { data: existingAdm, error: admError } = await supabase
+          .from('students')
+          .select('admission_number')
+          .eq('admission_number', admissionNumber.toUpperCase())
+          .maybeSingle();
+
+        if (admError) throw admError;
+        if (existingAdm) {
+          showToast('Admission number is already registered in cloud database.', 'error');
+          return;
+        }
+      } catch (err: any) {
+        console.error('Supabase validation error:', err);
+        showToast(`Database validation error: ${err.message || err}`, 'error');
+        return;
+      }
+    } else {
+      const emailExists = students.some((s) => s.email.toLowerCase() === email.toLowerCase());
+      if (emailExists) {
+        showToast('Email address is already registered locally.', 'error');
+        return;
+      }
+
+      const admExists = students.some((s) => s.admissionNumber.toUpperCase() === admissionNumber.toUpperCase());
+      if (admExists) {
+        showToast('Admission number is already registered locally.', 'error');
+        return;
+      }
     }
 
     // Create student
+    const hashedPassword = await hashPassword(password);
     const newStudent: Student = {
-      id: (students.length + 1).toString(),
+      id: Date.now().toString(),
       fullName,
       email,
       class: stClass,
       section,
       admissionNumber: admissionNumber.toUpperCase(),
+      password: hashedPassword,
       createdAt: new Date().toISOString()
     };
+
+    if (supabaseStatus === 'connected') {
+      try {
+        const { error: insertError } = await supabase
+          .from('students')
+          .insert({
+            id: newStudent.id,
+            full_name: newStudent.fullName,
+            email: newStudent.email,
+            class: newStudent.class,
+            section: newStudent.section,
+            admission_number: newStudent.admissionNumber,
+            password: hashedPassword,
+            created_at: newStudent.createdAt
+          });
+
+        if (insertError) throw insertError;
+        addAuditLog(`Student ${newStudent.fullName} registered directly on Supabase`, 'success');
+      } catch (err: any) {
+        console.error('Supabase insertion error:', err);
+        showToast(`Cloud registration failed: ${err.message || err}`, 'error');
+        return;
+      }
+    }
 
     setStudents((prev) => [...prev, newStudent]);
     showToast('Registration successful! Please login.', 'success');
@@ -350,7 +597,7 @@ export default function App() {
   };
 
   // Student Login
-  const handleLoginSubmit = (e: React.FormEvent) => {
+  const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const { email, password } = loginData;
 
@@ -359,16 +606,72 @@ export default function App() {
       return;
     }
 
+    const hashedInput = await hashPassword(password);
+
+    if (supabaseStatus === 'connected') {
+      try {
+        const { data, error } = await supabase
+          .from('students')
+          .select('*')
+          .eq('email', email)
+          .maybeSingle();
+
+        if (error) throw error;
+
+        if (!data) {
+          showToast('Email address not found in cloud database. Please register first.', 'error');
+          return;
+        }
+
+        const isMatch = isSHA256(data.password)
+          ? data.password === hashedInput
+          : data.password === password;
+
+        if (!isMatch) {
+          showToast('Incorrect password. Please try again.', 'error');
+          return;
+        }
+
+        const loggedStudent: Student = {
+          id: data.id,
+          fullName: data.full_name,
+          email: data.email,
+          class: data.class,
+          section: data.section,
+          admissionNumber: data.admission_number,
+          password: data.password,
+          createdAt: data.created_at
+        };
+
+        setActiveStudent(loggedStudent);
+        setAdminLoggedIn(false);
+        showToast(`Welcome back, ${loggedStudent.fullName}! (Cloud Verified)`, 'success');
+        setActivePage('StudentDashboard');
+        return;
+      } catch (err: any) {
+        console.error('Supabase login error:', err);
+        showToast(`Database error: ${err.message || err}. Attempting offline login fallback...`, 'info');
+      }
+    }
+
+    // Offline Fallback
     const student = students.find(
       (s) => s.email.toLowerCase() === email.toLowerCase()
     );
 
-    // In this simulated backend, we accept any password as correct for simplicity of demo, 
-    // but validate if student email is registered!
     if (student) {
+      const storedPassword = student.password || 'password123';
+      const isMatch = isSHA256(storedPassword)
+        ? storedPassword === hashedInput
+        : storedPassword === password;
+
+      if (!isMatch) {
+        showToast('Incorrect password. Please try again.', 'error');
+        return;
+      }
       setActiveStudent(student);
       setAdminLoggedIn(false);
-      showToast(`Welcome back, ${student.fullName}!`, 'success');
+      showToast(`Welcome back, ${student.fullName}! (Local Session)`, 'success');
       setActivePage('StudentDashboard');
     } else {
       showToast('Email address not found. Please register first.', 'error');
@@ -376,7 +679,7 @@ export default function App() {
   };
 
   // Admin Login
-  const handleAdminLoginSubmit = (e: React.FormEvent) => {
+  const handleAdminLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const { username, password } = adminLoginData;
 
@@ -385,11 +688,39 @@ export default function App() {
       return;
     }
 
-    // Default seed credentials
+    if (supabaseStatus === 'connected') {
+      try {
+        const { data, error } = await supabase
+          .from('admins')
+          .select('*')
+          .eq('username', username)
+          .maybeSingle();
+
+        if (error) throw error;
+
+        if (data) {
+          if (data.password === password) {
+            setAdminLoggedIn(true);
+            setActiveStudent(null);
+            showToast('Administrative authentication successful (Supabase Cloud Verified)!', 'success');
+            setActivePage('AdminDashboard');
+            setSelectedTab('dashboard');
+            return;
+          } else {
+            showToast('Invalid administrative password.', 'error');
+            return;
+          }
+        }
+      } catch (err: any) {
+        console.error('Supabase admin login error:', err);
+      }
+    }
+
+    // Default seed credentials fallback
     if (username === 'admin' && password === 'admin123') {
       setAdminLoggedIn(true);
       setActiveStudent(null);
-      showToast('Administrative authentication successful!', 'success');
+      showToast('Administrative authentication successful (Local Fallback)!', 'success');
       setActivePage('AdminDashboard');
       setSelectedTab('dashboard');
     } else {
@@ -448,7 +779,7 @@ export default function App() {
   };
 
   // Submit Event Proposal
-  const handleEventSubmit = (e: React.FormEvent) => {
+  const handleEventSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const { title, description, category, eventDate, image } = newEventData;
 
@@ -465,7 +796,7 @@ export default function App() {
 
     const isAutoApproved = systemSettings.autoModeration;
     const newEvent: SchoolEvent = {
-      id: (events.length + 101).toString(),
+      id: Date.now().toString(),
       studentId: activeStudent.id,
       studentName: activeStudent.fullName,
       title,
@@ -476,6 +807,31 @@ export default function App() {
       status: isAutoApproved ? 'Approved' : 'Pending',
       createdAt: new Date().toISOString()
     };
+
+    if (supabaseStatus === 'connected') {
+      try {
+        const { error } = await supabase
+          .from('events')
+          .insert({
+            id: newEvent.id,
+            student_id: newEvent.studentId,
+            student_name: newEvent.studentName,
+            title: newEvent.title,
+            description: newEvent.description,
+            category: newEvent.category,
+            event_date: newEvent.eventDate,
+            image: newEvent.image,
+            status: newEvent.status,
+            created_at: newEvent.createdAt
+          });
+        if (error) throw error;
+        addAuditLog(`Event proposed on Supabase: "${title}" by ${activeStudent.fullName}`, 'success');
+      } catch (err: any) {
+        console.error('Supabase event insert error:', err);
+        showToast(`Database error submitting event: ${err.message || err}`, 'error');
+        return;
+      }
+    }
 
     setEvents((prev) => [newEvent, ...prev]);
     
@@ -503,20 +859,59 @@ export default function App() {
     setShowDeleteConfirm({ id, type });
   };
 
-  const executeDelete = () => {
+  const executeDelete = async () => {
     if (!showDeleteConfirm) return;
     const { id, type } = showDeleteConfirm;
 
     if (type === 'event') {
       const target = events.find((ev) => ev.id === id);
       const titleStr = target ? target.title : id;
+
+      if (supabaseStatus === 'connected') {
+        try {
+          const { error } = await supabase
+            .from('events')
+            .delete()
+            .eq('id', id);
+          if (error) throw error;
+          addAuditLog(`Permanently deleted event proposal on Supabase: "${titleStr}"`, 'warning');
+        } catch (err: any) {
+          console.error('Supabase event delete error:', err);
+          showToast(`Database delete error: ${err.message || err}`, 'error');
+          return;
+        }
+      }
+
       setEvents((prev) => prev.filter((ev) => ev.id !== id));
       addAuditLog(`Permanently deleted event proposal: "${titleStr}"`, 'warning');
       showToast('Event proposal permanently deleted.', 'success');
     } else if (type === 'student') {
       const target = students.find((s) => s.id === id);
       const nameStr = target ? target.fullName : id;
-      // Cascading delete student and their event submissions
+
+      if (supabaseStatus === 'connected') {
+        try {
+          // Cascade delete: delete events first
+          const { error: eventsError } = await supabase
+            .from('events')
+            .delete()
+            .eq('student_id', id);
+          if (eventsError) throw eventsError;
+
+          const { error: studentError } = await supabase
+            .from('students')
+            .delete()
+            .eq('id', id);
+          if (studentError) throw studentError;
+
+          addAuditLog(`Deleted student and cascades on Supabase: "${nameStr}"`, 'error');
+        } catch (err: any) {
+          console.error('Supabase student delete error:', err);
+          showToast(`Database student delete error: ${err.message || err}`, 'error');
+          return;
+        }
+      }
+
       setStudents((prev) => prev.filter((s) => s.id !== id));
       setEvents((prev) => prev.filter((ev) => ev.studentId !== id));
       addAuditLog(`Deleted student account and cascades: "${nameStr}"`, 'error');
@@ -527,9 +922,27 @@ export default function App() {
   };
 
   // Admin approval decisions
-  const handleAdminDecision = (id: string, decision: EventStatus, reason?: string) => {
+  const handleAdminDecision = async (id: string, decision: EventStatus, reason?: string) => {
     const target = events.find((ev) => ev.id === id);
     const titleStr = target ? target.title : id;
+
+    if (supabaseStatus === 'connected') {
+      try {
+        const { error } = await supabase
+          .from('events')
+          .update({
+            status: decision,
+            rejection_reason: decision === 'Rejected' ? (reason || null) : null
+          })
+          .eq('id', id);
+        if (error) throw error;
+        addAuditLog(`Updated status on Supabase for event: "${titleStr}"`, 'success');
+      } catch (err: any) {
+        console.error('Supabase admin decision update error:', err);
+        showToast(`Database status update error: ${err.message || err}`, 'error');
+        return;
+      }
+    }
 
     setEvents((prev) =>
       prev.map((ev) => (ev.id === id ? { ...ev, status: decision, rejectionReason: decision === 'Rejected' ? reason : undefined } : ev))
@@ -545,9 +958,9 @@ export default function App() {
   };
 
   // Handle manual student registration by admin
-  const handleManualStudentSubmit = (e: React.FormEvent) => {
+  const handleManualStudentSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const { fullName, email, class: stClass, section, admissionNumber } = manualStudentData;
+    const { fullName, email, class: stClass, section, admissionNumber, password } = manualStudentData;
 
     if (!fullName || !email || !stClass || !section || !admissionNumber) {
       showToast('Please fill in all student details.', 'error');
@@ -570,15 +983,42 @@ export default function App() {
       return;
     }
 
+    const rawPassword = password || 'password123';
+    const hashedPassword = await hashPassword(rawPassword);
+
     const newStudent: Student = {
-      id: (students.length + 1).toString(),
+      id: Date.now().toString(),
       fullName,
       email,
       class: stClass,
       section,
       admissionNumber: admissionNumber.toUpperCase(),
+      password: hashedPassword,
       createdAt: new Date().toISOString()
     };
+
+    if (supabaseStatus === 'connected') {
+      try {
+        const { error } = await supabase
+          .from('students')
+          .insert({
+            id: newStudent.id,
+            full_name: newStudent.fullName,
+            email: newStudent.email,
+            class: newStudent.class,
+            section: newStudent.section,
+            admission_number: newStudent.admissionNumber,
+            password: hashedPassword,
+            created_at: newStudent.createdAt
+          });
+        if (error) throw error;
+        addAuditLog(`Student ${fullName} registered directly on Supabase`, 'success');
+      } catch (err: any) {
+        console.error('Supabase manual insert student error:', err);
+        showToast(`Database register error: ${err.message || err}`, 'error');
+        return;
+      }
+    }
 
     setStudents((prev) => [...prev, newStudent]);
     addAuditLog(`Manually registered student: ${fullName} (${stClass}-${section})`, 'success');
@@ -699,7 +1139,6 @@ export default function App() {
             </div>
             <div>
               <span className="font-display font-bold text-lg tracking-tight block text-white">{systemSettings.boardTitle}</span>
-              <span className="text-[10px] text-zinc-400 font-mono">XAMPP / WAMP Package Ready</span>
             </div>
           </button>
 
@@ -815,52 +1254,103 @@ export default function App() {
           <div>
             {/* Hero Section */}
             <section className="relative overflow-hidden py-24 border-b border-white/5">
-              <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-radial from-violet-600/10 via-blue-600/5 to-transparent pointer-events-none blur-3xl" />
+              <div className="absolute top-1/2 left-1/3 -translate-y-1/2 w-[800px] h-[800px] bg-radial from-violet-600/10 via-indigo-600/5 to-transparent pointer-events-none blur-3xl" />
               
-              <div className="max-w-4xl mx-auto text-center px-4 relative z-10">
-                <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-violet-600/10 border border-violet-500/20 text-violet-300 text-xs font-semibold tracking-wide uppercase mb-6 shadow-[0_0_15px_rgba(139,92,246,0.1)]">
-                  <Clock className="w-3.5 h-3.5" /> Stay Updated, Stay Engaged
-                </div>
-                
-                <h1 className="font-display font-extrabold text-4xl sm:text-6xl tracking-tight text-white mb-6 leading-none">
-                  {systemSettings.boardTitle}
-                </h1>
-                
-                <p className="text-zinc-400 text-base sm:text-lg leading-relaxed max-w-2xl mx-auto mb-10">
-                  Explore academic forums, music shows, tech workshops, and sports championships. Submit proposed life ideas and coordinate campus life instantly.
-                </p>
+              <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 relative z-10">
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-12 items-center">
+                  
+                  {/* Left Column: Text & Actions */}
+                  <div className="lg:col-span-7 text-center lg:text-left space-y-6">
+                    <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-violet-600/10 border border-violet-500/20 text-violet-300 text-xs font-semibold tracking-wide uppercase shadow-[0_0_15px_rgba(139,92,246,0.1)]">
+                      <Clock className="w-3.5 h-3.5 animate-pulse" /> Stay Updated, Stay Engaged
+                    </div>
+                    
+                    <h1 className="font-display font-extrabold text-4xl sm:text-6xl tracking-tight text-white leading-none">
+                      {systemSettings.boardTitle}
+                    </h1>
+                    
+                    <p className="text-zinc-400 text-base sm:text-lg leading-relaxed max-w-2xl mx-auto lg:mx-0">
+                      Explore academic forums, music shows, tech workshops, and sports championships. Submit proposed life ideas and coordinate campus life instantly.
+                    </p>
 
-                <div className="flex flex-wrap items-center justify-center gap-4">
-                  {activeStudent ? (
-                    <button
-                      onClick={() => setActivePage('StudentDashboard')}
-                      className="px-6 py-3 rounded-xl bg-violet-600 hover:bg-violet-500 text-white font-medium flex items-center gap-2 shadow-[0_4px_20px_rgba(139,92,246,0.3)] hover:scale-[1.02] transition-all cursor-pointer"
-                    >
-                      Go to Dashboard <ArrowRight className="w-5 h-5" />
-                    </button>
-                  ) : adminLoggedIn ? (
-                    <button
-                      onClick={() => setActivePage('AdminDashboard')}
-                      className="px-6 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-medium flex items-center gap-2 shadow-[0_4px_20px_rgba(99,102,241,0.3)] hover:scale-[1.02] transition-all cursor-pointer"
-                    >
-                      Admin Dashboard <ArrowRight className="w-5 h-5" />
-                    </button>
-                  ) : (
-                    <>
-                      <button
-                        onClick={() => setActivePage('SignUp')}
-                        className="px-6 py-3 rounded-xl bg-violet-600 hover:bg-violet-500 text-white font-medium shadow-[0_4px_20px_rgba(139,92,246,0.3)] hover:scale-[1.02] transition-all cursor-pointer"
-                      >
-                        Join Now
-                      </button>
-                      <button
-                        onClick={() => setActivePage('Login')}
-                        className="px-6 py-3 rounded-xl bg-zinc-900 border border-white/10 text-white hover:bg-zinc-800 font-medium hover:scale-[1.02] transition-all cursor-pointer"
-                      >
-                        Student Login
-                      </button>
-                    </>
-                  )}
+                    <div className="flex flex-wrap items-center justify-center lg:justify-start gap-4 pt-2">
+                      {activeStudent ? (
+                        <button
+                          onClick={() => setActivePage('StudentDashboard')}
+                          className="px-6 py-3 rounded-xl bg-violet-600 hover:bg-violet-500 text-white font-medium flex items-center gap-2 shadow-[0_4px_20px_rgba(139,92,246,0.3)] hover:scale-[1.02] transition-all cursor-pointer"
+                        >
+                          Go to Dashboard <ArrowRight className="w-5 h-5" />
+                        </button>
+                      ) : adminLoggedIn ? (
+                        <button
+                          onClick={() => setActivePage('AdminDashboard')}
+                          className="px-6 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-medium flex items-center gap-2 shadow-[0_4px_20px_rgba(99,102,241,0.3)] hover:scale-[1.02] transition-all cursor-pointer"
+                        >
+                          Admin Dashboard <ArrowRight className="w-5 h-5" />
+                        </button>
+                      ) : (
+                        <>
+                          <button
+                            onClick={() => setActivePage('SignUp')}
+                            className="px-6 py-3 rounded-xl bg-violet-600 hover:bg-violet-500 text-white font-medium shadow-[0_4px_20px_rgba(139,92,246,0.3)] hover:scale-[1.02] transition-all cursor-pointer"
+                          >
+                            Join Now
+                          </button>
+                          <button
+                            onClick={() => setActivePage('Login')}
+                            className="px-6 py-3 rounded-xl bg-zinc-900 border border-white/10 text-white hover:bg-zinc-800 font-medium hover:scale-[1.02] transition-all cursor-pointer"
+                          >
+                            Student Login
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Right Column: Visual Frame with School Events Board Image */}
+                  <div className="lg:col-span-5 relative mt-8 lg:mt-0 flex justify-center">
+                    {/* Visual background ambient glow behind the picture */}
+                    <div className="absolute -inset-4 rounded-3xl bg-gradient-to-tr from-purple-600 to-indigo-600 opacity-20 blur-2xl pointer-events-none" />
+                    
+                    {/* Styled perspective frame container */}
+                    <div className="relative w-full max-w-md aspect-[4/3] rounded-2xl border border-white/10 bg-zinc-900/50 p-2 shadow-2xl overflow-hidden group">
+                      
+                      {/* Image tag with custom referrerPolicy as per rules */}
+                      <img
+                        src="https://images.unsplash.com/photo-1517245386807-bb43f82c33c4?auto=format&fit=crop&w=800&q=80"
+                        alt="Active student collaborative events and workshops on school board"
+                        referrerPolicy="no-referrer"
+                        className="w-full h-full object-cover rounded-xl grayscale-[20%] group-hover:grayscale-0 transition-all duration-700 ease-out"
+                      />
+                      
+                      {/* Dark gradient overlay */}
+                      <div className="absolute inset-0 bg-gradient-to-t from-zinc-950 via-transparent to-transparent opacity-90" />
+                      
+                      {/* Floating Micro Event Badge 1: Sports Event */}
+                      <div className="absolute top-6 -left-4 bg-zinc-900/90 backdrop-blur-md border border-white/10 p-2.5 rounded-xl shadow-lg flex items-center gap-2.5 animate-bounce-slow">
+                        <div className="w-8 h-8 rounded-lg bg-orange-600/20 text-orange-400 flex items-center justify-center font-bold text-xs">
+                          🏀
+                        </div>
+                        <div>
+                          <span className="text-[9px] text-zinc-500 uppercase block tracking-wider">Upcoming Match</span>
+                          <span className="text-xs font-bold text-white block">Basketball Cup</span>
+                        </div>
+                      </div>
+
+                      {/* Floating Micro Event Badge 2: Tech Event */}
+                      <div className="absolute bottom-6 -right-4 bg-zinc-900/90 backdrop-blur-md border border-emerald-500/20 p-2.5 rounded-xl shadow-lg flex items-center gap-2.5 animate-pulse">
+                        <div className="w-8 h-8 rounded-lg bg-emerald-600/20 text-emerald-400 flex items-center justify-center font-bold text-xs">
+                          💻
+                        </div>
+                        <div>
+                          <span className="text-[9px] text-emerald-400 uppercase font-extrabold block tracking-wider">LIVE CODE</span>
+                          <span className="text-xs font-bold text-white block">AI Hackathon</span>
+                        </div>
+                      </div>
+
+                    </div>
+                  </div>
+
                 </div>
               </div>
             </section>
@@ -920,45 +1410,94 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Approved Events Grid */}
+                {/* Approved Events Grid replaced with Left-to-Right Marquee */}
                 {approvedEvents.length > 0 ? (
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
-                    {approvedEvents.map((event) => (
-                      <article
-                        key={event.id}
-                        className="glass rounded-2xl overflow-hidden hover:border-violet-500/20 hover:shadow-2xl hover:-translate-y-1 transition-all duration-300 flex flex-col h-full"
-                      >
-                        <div className="relative h-48 overflow-hidden bg-zinc-900">
-                          <img
-                            src={event.image}
-                            alt={event.title}
-                            className="w-full h-full object-cover transition-transform duration-500 hover:scale-105"
-                          />
-                          <span className="absolute top-4 right-4 text-xs font-bold bg-violet-600/90 text-white px-3 py-1.5 rounded-full shadow-lg">
-                            {event.category}
-                          </span>
-                        </div>
-
-                        <div className="p-6 flex flex-col flex-grow">
-                          <div className="flex items-center justify-between gap-4 text-xs text-zinc-400 mb-3">
-                            <span className="flex items-center gap-1">
-                              <Calendar className="w-3.5 h-3.5 text-violet-400" /> {event.eventDate}
-                            </span>
-                            <span className="flex items-center gap-1 font-medium">
-                              <User className="w-3.5 h-3.5 text-zinc-500" /> {event.studentName}
+                  <div className="marquee-container relative py-4">
+                    <div 
+                      className="marquee-track animate-marquee-ltr"
+                      style={{ 
+                        animationDuration: `${Math.max(25, getRepeatedEvents(approvedEvents).length * 5)}s` 
+                      }}
+                    >
+                      {/* Original track */}
+                      {getRepeatedEvents(approvedEvents).map((event, idx) => (
+                        <article
+                          key={`orig-${event.id}-${idx}`}
+                          className="glass rounded-2xl overflow-hidden hover:border-violet-500/20 hover:shadow-2xl hover:-translate-y-1 transition-all duration-300 flex flex-col h-full w-[290px] sm:w-[350px] shrink-0"
+                        >
+                          <div className="relative h-48 overflow-hidden bg-zinc-900">
+                            <img
+                              src={event.image}
+                              alt={event.title}
+                              referrerPolicy="no-referrer"
+                              className="w-full h-full object-cover transition-transform duration-500 hover:scale-105"
+                            />
+                            <span className="absolute top-4 right-4 text-xs font-bold bg-violet-600/90 text-white px-3 py-1.5 rounded-full shadow-lg">
+                              {event.category}
                             </span>
                           </div>
 
-                          <h3 className="font-display font-bold text-lg text-white mb-2 line-clamp-1">
-                            {event.title}
-                          </h3>
-                          
-                          <p className="text-zinc-400 text-sm leading-relaxed line-clamp-3 mb-6">
-                            {event.description}
-                          </p>
-                        </div>
-                      </article>
-                    ))}
+                          <div className="p-6 flex flex-col flex-grow">
+                            <div className="flex items-center justify-between gap-4 text-xs text-zinc-400 mb-3">
+                              <span className="flex items-center gap-1">
+                                <Calendar className="w-3.5 h-3.5 text-violet-400" /> {event.eventDate}
+                              </span>
+                              <span className="flex items-center gap-1 font-medium">
+                                <User className="w-3.5 h-3.5 text-zinc-500" /> {event.studentName}
+                              </span>
+                            </div>
+
+                            <h3 className="font-display font-bold text-lg text-white mb-2 line-clamp-1">
+                              {event.title}
+                            </h3>
+                            
+                            <p className="text-zinc-400 text-sm leading-relaxed line-clamp-3 mb-6">
+                              {event.description}
+                            </p>
+                          </div>
+                        </article>
+                      ))}
+
+                      {/* Duplicate track for seamless infinite marquee loop */}
+                      {getRepeatedEvents(approvedEvents).map((event, idx) => (
+                        <article
+                          key={`dup-${event.id}-${idx}`}
+                          aria-hidden="true"
+                          className="glass rounded-2xl overflow-hidden hover:border-violet-500/20 hover:shadow-2xl hover:-translate-y-1 transition-all duration-300 flex flex-col h-full w-[290px] sm:w-[350px] shrink-0 marquee-duplicate-track"
+                        >
+                          <div className="relative h-48 overflow-hidden bg-zinc-900">
+                            <img
+                              src={event.image}
+                              alt={event.title}
+                              referrerPolicy="no-referrer"
+                              className="w-full h-full object-cover transition-transform duration-500 hover:scale-105"
+                            />
+                            <span className="absolute top-4 right-4 text-xs font-bold bg-violet-600/90 text-white px-3 py-1.5 rounded-full shadow-lg">
+                              {event.category}
+                            </span>
+                          </div>
+
+                          <div className="p-6 flex flex-col flex-grow">
+                            <div className="flex items-center justify-between gap-4 text-xs text-zinc-400 mb-3">
+                              <span className="flex items-center gap-1">
+                                <Calendar className="w-3.5 h-3.5 text-violet-400" /> {event.eventDate}
+                              </span>
+                              <span className="flex items-center gap-1 font-medium">
+                                <User className="w-3.5 h-3.5 text-zinc-500" /> {event.studentName}
+                              </span>
+                            </div>
+
+                            <h3 className="font-display font-bold text-lg text-white mb-2 line-clamp-1">
+                              {event.title}
+                            </h3>
+                            
+                            <p className="text-zinc-400 text-sm leading-relaxed line-clamp-3 mb-6">
+                              {event.description}
+                            </p>
+                          </div>
+                        </article>
+                      ))}
+                    </div>
                   </div>
                 ) : (
                   <div className="glass rounded-2xl p-12 text-center max-w-md mx-auto border border-dashed border-white/10">
@@ -1247,12 +1786,10 @@ export default function App() {
                   <input
                     type="text"
                     required
-                    placeholder="admin"
                     value={adminLoginData.username}
                     onChange={(e) => setAdminLoginData({ ...adminLoginData, username: e.target.value })}
                     className="w-full bg-[#0a0a0a] border border-[#2d2d2d] rounded-xl px-4 py-2.5 text-sm text-white placeholder-zinc-600 focus:border-purple-500/50 outline-none transition-colors"
                   />
-                  <span className="text-[10px] text-zinc-500 block mt-1">Simulated Default: <strong className="text-zinc-300">admin</strong></span>
                 </div>
 
                 <div>
@@ -1265,7 +1802,6 @@ export default function App() {
                     onChange={(e) => setAdminLoginData({ ...adminLoginData, password: e.target.value })}
                     className="w-full bg-[#0a0a0a] border border-[#2d2d2d] rounded-xl px-4 py-2.5 text-sm text-white placeholder-zinc-600 focus:border-purple-500/50 outline-none transition-colors"
                   />
-                  <span className="text-[10px] text-zinc-500 block mt-1">Simulated Default: <strong className="text-zinc-300">admin123</strong></span>
                 </div>
 
                 <button
@@ -1456,7 +1992,7 @@ export default function App() {
                         </div>
                       ) : (
                         <div className="relative rounded-xl overflow-hidden border border-[#2d2d2d] max-h-48 bg-zinc-950">
-                          <img src={imagePreview} alt="Upload preview" className="w-full h-full object-cover" />
+                          <img src={imagePreview} alt="Upload preview" referrerPolicy="no-referrer" className="w-full h-full object-cover" />
                           <button
                             type="button"
                             onClick={clearImagePreview}
@@ -1644,6 +2180,16 @@ export default function App() {
                       }`}
                     >
                       <FileCode className="w-4.5 h-4.5 text-violet-400" /> PHP Source Package
+                    </button>
+                    <button
+                      onClick={() => setSelectedTab('supabase')}
+                      className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-semibold flex items-center gap-3 transition-all ${
+                        selectedTab === 'supabase'
+                          ? 'bg-gradient-to-tr from-purple-600 to-indigo-600 text-white shadow-md'
+                          : 'text-zinc-400 hover:bg-white/5 hover:text-white'
+                      }`}
+                    >
+                      <Database className="w-4.5 h-4.5 text-emerald-400" /> Supabase Database
                     </button>
                   </div>
                 </nav>
@@ -2090,7 +2636,7 @@ export default function App() {
                                   <tr key={ev.id} className="hover:bg-white/[0.01] transition-colors">
                                     <td className="py-4 px-5">
                                       <div className="w-12 h-12 rounded-xl overflow-hidden border border-[#2d2d2d] bg-zinc-950 shrink-0 shadow-[0_0_8px_rgba(0,0,0,0.5)]">
-                                        <img src={ev.image} alt="Cover" className="w-full h-full object-cover" />
+                                        <img src={ev.image} alt="Cover" referrerPolicy="no-referrer" className="w-full h-full object-cover" />
                                       </div>
                                     </td>
                                     <td className="py-4 px-5 max-w-xs">
@@ -2409,6 +2955,142 @@ export default function App() {
                   </div>
                 )}
 
+                {/* 6. Supabase Real-time Cloud Integration Sub-View */}
+                {selectedTab === 'supabase' && (
+                  <div className="space-y-6 animate-fade-in">
+                    <div className="glass rounded-2xl p-6 border border-emerald-500/15 relative overflow-hidden">
+                      <div className="absolute top-0 right-0 w-96 h-96 bg-radial from-emerald-600/5 to-transparent pointer-events-none blur-3xl" />
+                      
+                      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-6 mb-6">
+                        <div>
+                          <span className={`text-xs font-semibold px-3 py-1 rounded-full uppercase tracking-wider mb-3 inline-block ${
+                            supabaseStatus === 'connected'
+                              ? 'bg-emerald-600/10 border border-emerald-500/20 text-emerald-400'
+                              : supabaseStatus === 'connecting'
+                              ? 'bg-amber-600/10 border border-amber-500/20 text-amber-400'
+                              : supabaseStatus === 'missing_tables'
+                              ? 'bg-blue-600/10 border border-blue-500/20 text-blue-400'
+                              : 'bg-rose-600/10 border border-rose-500/20 text-rose-400'
+                          }`}>
+                            {supabaseStatus === 'connected' && '● Active & Connected'}
+                            {supabaseStatus === 'connecting' && '⚡ Testing Connection...'}
+                            {supabaseStatus === 'missing_tables' && '⚠ Connected (Tables Missing)'}
+                            {supabaseStatus === 'disconnected' && '❌ Disconnected'}
+                          </span>
+                          <h2 className="font-display font-extrabold text-2xl text-white flex items-center gap-2">
+                            <Database className="w-6 h-6 text-emerald-400" /> Supabase Real-time Cloud Integration
+                          </h2>
+                          <p className="text-zinc-400 text-sm mt-1">
+                            This application is fully integrated with your Supabase database project. Manage cloud tables, sync local data, and review database schemas.
+                          </p>
+                        </div>
+                        
+                        <div className="flex flex-wrap gap-3">
+                          <button
+                            onClick={() => checkSupabaseConnection()}
+                            className="px-4 py-2.5 bg-zinc-900 border border-white/10 hover:bg-zinc-800 text-xs font-bold text-white rounded-xl transition-all flex items-center gap-2 cursor-pointer"
+                          >
+                            <Activity className="w-3.5 h-3.5" /> Re-test Connection
+                          </button>
+                          
+                          {(supabaseStatus === 'connected' || supabaseStatus === 'missing_tables') && (
+                            <button
+                              onClick={syncLocalToSupabase}
+                              className="px-4 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-xs font-bold text-white rounded-xl transition-all flex items-center gap-2 shadow-lg shadow-emerald-600/20 cursor-pointer"
+                            >
+                              <UploadCloud className="w-3.5 h-3.5" /> Push Local Data to Cloud
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Info Panels */}
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                        <div className="bg-zinc-950/40 border border-white/5 p-4 rounded-xl">
+                          <span className="text-xs text-zinc-500 uppercase tracking-wide block mb-1">Student Accounts</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-2xl font-bold text-white">{students.length}</span>
+                            <span className="text-xs text-zinc-400">active profiles</span>
+                          </div>
+                        </div>
+                        <div className="bg-zinc-950/40 border border-white/5 p-4 rounded-xl">
+                          <span className="text-xs text-zinc-500 uppercase tracking-wide block mb-1">Board Submissions</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-2xl font-bold text-white">{events.length}</span>
+                            <span className="text-xs text-zinc-400">total proposals</span>
+                          </div>
+                        </div>
+                        <div className="bg-zinc-950/40 border border-white/5 p-4 rounded-xl">
+                          <span className="text-xs text-zinc-500 uppercase tracking-wide block mb-1">Cloud Endpoint URL</span>
+                          <span className="text-xs font-mono text-zinc-400 block truncate">https://jyimhqpbitvysgvvnij.supabase.co</span>
+                        </div>
+                      </div>
+
+                      {/* Setup Info */}
+                      {supabaseStatus === 'disconnected' && (
+                        <div className="bg-rose-500/10 border border-rose-500/20 rounded-xl p-5 mb-6 flex gap-4 items-start animate-fade-in">
+                          <AlertCircle className="w-5.5 h-5.5 text-rose-400 shrink-0 mt-0.5" />
+                          <div className="space-y-2.5">
+                            <h4 className="font-semibold text-rose-400 text-sm">Supabase Project is Offline or Paused</h4>
+                            <p className="text-zinc-400 text-xs leading-relaxed">
+                              The application was unable to establish a live connection to the default cloud database. This typically happens if the shared free-tier demonstration project is <strong>automatically paused by Supabase</strong> due to inactivity, or if network ports are blocked by sandboxing.
+                            </p>
+                            <div className="text-zinc-300 text-xs font-bold pt-1">
+                              How to proceed:
+                            </div>
+                            <ul className="list-disc pl-4 text-zinc-400 text-xs space-y-1.5 leading-relaxed">
+                              <li>
+                                <strong className="text-zinc-200">Active Offline Fallback</strong>: All client features (login, signup, proposal boards, auto-moderation) are fully operational right now using local browser storage! You can continue experimenting with the application without any interruption.
+                              </li>
+                              <li>
+                                <strong className="text-zinc-200">Use Your Own Free Database</strong>: Set up a free account at <a href="https://supabase.com" target="_blank" rel="noopener noreferrer" className="text-emerald-400 hover:underline font-semibold">supabase.com</a>, create a project, and enter your credentials into your project environment configuration:
+                                <div className="mt-2 bg-black/60 border border-white/5 rounded-lg p-3 font-mono text-[11px] text-zinc-300 leading-normal">
+                                  VITE_SUPABASE_URL="https://your-project.supabase.co"<br/>
+                                  VITE_SUPABASE_ANON_KEY="your-anon-key"
+                                </div>
+                              </li>
+                            </ul>
+                          </div>
+                        </div>
+                      )}
+
+                      {supabaseStatus === 'missing_tables' && (
+                        <div className="bg-amber-500/10 border border-amber-500/20 rounded-xl p-5 mb-6 flex gap-4 items-start">
+                          <AlertCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+                          <div>
+                            <h4 className="font-semibold text-amber-400 text-sm">Database Schema Setup Required!</h4>
+                            <p className="text-zinc-400 text-xs mt-1 leading-relaxed">
+                              Supabase connected successfully, but the required tables (<code className="text-amber-200">students</code>, <code className="text-emerald-200">events</code>, <code className="text-violet-200">admins</code>) do not exist yet. Copy the SQL script below, open your Supabase Dashboard SQL Editor, paste and run it, then click <strong>"Push Local Data to Cloud"</strong> or <strong>"Re-test Connection"</strong>.
+                            </p>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* SQL Schema Display */}
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between">
+                          <h4 className="text-xs font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-1.5">
+                            <FileCode className="w-4 h-4 text-emerald-400" /> PostgreSQL Initialization Schema Script
+                          </h4>
+                          <button
+                            onClick={() => {
+                              navigator.clipboard.writeText(SUPABASE_SQL_SETUP);
+                              showToast('SQL schema copied to clipboard!', 'success');
+                            }}
+                            className="text-xs font-semibold text-emerald-400 hover:text-emerald-300 flex items-center gap-1 cursor-pointer"
+                          >
+                            <Copy className="w-3.5 h-3.5" /> Copy SQL Script
+                          </button>
+                        </div>
+                        <pre className="bg-[#050505] border border-white/5 rounded-xl p-4 text-[11px] font-mono text-zinc-300 overflow-x-auto max-h-96 leading-normal select-all">
+                          {SUPABASE_SQL_SETUP}
+                        </pre>
+                      </div>
+
+                    </div>
+                  </div>
+                )}
+
               </div>
             </div>
           </section>
@@ -2452,6 +3134,228 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* --- INSPECT PROPOSAL DETAIL MODAL --- */}
+      {detailEvent && (() => {
+        const proposingStudent = students.find((s) => s.id === detailEvent.studentId);
+        return (
+          <div className="fixed inset-0 z-[2000] bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
+            <div className="max-w-2xl w-full bg-zinc-950 border border-white/10 rounded-2xl overflow-hidden shadow-2xl animate-fade-in my-8">
+              {/* Cover Image Header if exists */}
+              <div className="relative h-48 bg-zinc-900 overflow-hidden">
+                {detailEvent.image ? (
+                  <img
+                    src={detailEvent.image}
+                    alt={detailEvent.title}
+                    referrerPolicy="no-referrer"
+                    className="w-full h-full object-cover"
+                  />
+                ) : (
+                  <div className="w-full h-full bg-gradient-to-tr from-purple-950/40 to-indigo-950/40 flex items-center justify-center text-zinc-600">
+                    <Calendar className="w-16 h-16 stroke-[1]" />
+                  </div>
+                )}
+                <div className="absolute inset-0 bg-gradient-to-t from-zinc-950 via-zinc-950/40 to-transparent" />
+                
+                {/* Close Button */}
+                <button
+                  onClick={() => {
+                    setDetailEvent(null);
+                    setInspectRejectMode(false);
+                    setInspectRejectReason('');
+                  }}
+                  className="absolute top-4 right-4 w-8 h-8 rounded-full bg-black/60 hover:bg-black/80 text-zinc-400 hover:text-white flex items-center justify-center transition-colors cursor-pointer border border-white/5"
+                  title="Close Modal"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+
+                <div className="absolute bottom-4 left-6 right-6">
+                  <div className="flex items-center gap-2 mb-2">
+                    <span className="px-2.5 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wider bg-purple-500/10 border border-purple-500/20 text-purple-400">
+                      {detailEvent.category}
+                    </span>
+                    <span className={`px-2.5 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wider ${
+                      detailEvent.status === 'Approved'
+                        ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400'
+                        : detailEvent.status === 'Rejected'
+                        ? 'bg-rose-500/10 border border-rose-500/20 text-rose-400'
+                        : 'bg-amber-500/10 border border-amber-500/20 text-amber-400'
+                    }`}>
+                      {detailEvent.status}
+                    </span>
+                  </div>
+                  <h3 className="font-display font-extrabold text-xl text-white line-clamp-1">
+                    {detailEvent.title}
+                  </h3>
+                </div>
+              </div>
+
+              {/* Content body */}
+              <div className="p-6 space-y-6 max-h-[60vh] overflow-y-auto">
+                {/* Date & Meta */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pb-4 border-b border-white/5">
+                  <div className="flex items-center gap-3 text-zinc-300">
+                    <Calendar className="w-4.5 h-4.5 text-purple-400" />
+                    <div>
+                      <span className="text-[10px] text-zinc-500 block uppercase tracking-wider">Scheduled Event Date</span>
+                      <span className="text-sm font-semibold font-mono">{detailEvent.eventDate}</span>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-3 text-zinc-300">
+                    <Clock className="w-4.5 h-4.5 text-purple-400" />
+                    <div>
+                      <span className="text-[10px] text-zinc-500 block uppercase tracking-wider">Submitted On</span>
+                      <span className="text-sm font-semibold font-mono">{new Date(detailEvent.createdAt).toLocaleDateString()}</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Description */}
+                <div className="space-y-1.5">
+                  <h4 className="text-xs font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-1.5">
+                    <Info className="w-4 h-4 text-purple-400" /> Proposal Description
+                  </h4>
+                  <p className="text-zinc-300 text-sm leading-relaxed whitespace-pre-wrap bg-zinc-900/50 p-4 rounded-xl border border-white/5">
+                    {detailEvent.description || 'No description provided.'}
+                  </p>
+                </div>
+
+                {/* Rejection reason (if exists) */}
+                {detailEvent.status === 'Rejected' && detailEvent.rejectionReason && (
+                  <div className="bg-rose-500/5 border border-rose-500/15 rounded-xl p-4 space-y-1">
+                    <h5 className="text-xs font-bold text-rose-400 uppercase tracking-wider flex items-center gap-1.5">
+                      <AlertCircle className="w-4 h-4" /> Administrative Rejection Feedback
+                    </h5>
+                    <p className="text-zinc-300 text-sm italic">
+                      "{detailEvent.rejectionReason}"
+                    </p>
+                  </div>
+                )}
+
+                {/* Proposer Info */}
+                <div className="bg-zinc-950 border border-white/5 rounded-xl p-4 space-y-3">
+                  <h4 className="text-xs font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-1.5 border-b border-white/5 pb-2">
+                    <UserCheck className="w-4 h-4 text-purple-400" /> Proposing Student Profile
+                  </h4>
+                  <div className="grid grid-cols-2 gap-y-3 gap-x-4">
+                    <div>
+                      <span className="text-[9px] text-zinc-500 block uppercase tracking-wide">Full Name</span>
+                      <span className="text-xs font-semibold text-white">{detailEvent.studentName}</span>
+                    </div>
+                    <div>
+                      <span className="text-[9px] text-zinc-500 block uppercase tracking-wide">Admission No.</span>
+                      <span className="text-xs font-mono font-semibold text-white">
+                        {proposingStudent?.admissionNumber || 'N/A'}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-[9px] text-zinc-500 block uppercase tracking-wide">Class & Section</span>
+                      <span className="text-xs font-semibold text-white">
+                        {proposingStudent ? `${proposingStudent.class} - Section ${proposingStudent.section}` : 'N/A'}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-[9px] text-zinc-500 block uppercase tracking-wide">Email Address</span>
+                      <span className="text-xs font-semibold text-white truncate block">
+                        {proposingStudent?.email || 'N/A'}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Reject Feedback Input Form */}
+                {inspectRejectMode && (
+                  <div className="bg-amber-500/5 border border-amber-500/10 rounded-xl p-4 space-y-3 animate-fade-in">
+                    <label className="block text-xs font-bold text-amber-400 uppercase tracking-wider">
+                      Provide Rejection Feedback Note *
+                    </label>
+                    <textarea
+                      rows={3}
+                      required
+                      value={inspectRejectReason}
+                      onChange={(e) => setInspectRejectReason(e.target.value)}
+                      placeholder="Please enter details on why this is rejected or changes needed..."
+                      className="w-full bg-[#0a0a0a] border border-white/10 rounded-xl p-3 text-xs text-white placeholder-zinc-600 outline-none focus:border-amber-500"
+                    />
+                    <div className="flex justify-end gap-2">
+                      <button
+                        onClick={() => setInspectRejectMode(false)}
+                        className="px-3 py-1.5 bg-zinc-900 border border-white/5 hover:bg-zinc-800 text-[11px] font-semibold text-zinc-400 hover:text-white rounded-lg transition-colors cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={async () => {
+                          if (!inspectRejectReason.trim()) {
+                            showToast('Please provide a rejection note.', 'error');
+                            return;
+                          }
+                          await handleAdminDecision(detailEvent.id, 'Rejected', inspectRejectReason);
+                          setDetailEvent(prev => prev ? { ...prev, status: 'Rejected', rejectionReason: inspectRejectReason } : null);
+                          setInspectRejectMode(false);
+                          setInspectRejectReason('');
+                        }}
+                        className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-[11px] font-semibold text-white rounded-lg transition-all cursor-pointer shadow-lg shadow-amber-600/20"
+                      >
+                        Submit Rejection
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Action Footer */}
+              <div className="px-6 py-4 bg-zinc-950/60 border-t border-white/5 flex flex-wrap items-center justify-between gap-3">
+                <button
+                  onClick={() => {
+                    handleDeleteRequest(detailEvent.id, 'event');
+                    setDetailEvent(null);
+                  }}
+                  className="px-3.5 py-2 bg-rose-950/40 hover:bg-rose-600 border border-rose-500/25 text-rose-400 hover:text-white text-xs font-bold uppercase tracking-wider rounded-xl transition-all flex items-center gap-1.5 cursor-pointer"
+                  title="Permanently Delete Proposal"
+                >
+                  <Trash2 className="w-3.5 h-3.5" /> Delete
+                </button>
+
+                <div className="flex items-center gap-2">
+                  {detailEvent.status !== 'Approved' && !inspectRejectMode && (
+                    <button
+                      onClick={async () => {
+                        await handleAdminDecision(detailEvent.id, 'Approved');
+                        setDetailEvent(prev => prev ? { ...prev, status: 'Approved' } : null);
+                      }}
+                      className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold uppercase tracking-wider rounded-xl transition-all cursor-pointer flex items-center gap-1.5 shadow-lg shadow-emerald-600/20"
+                    >
+                      <CheckCircle2 className="w-4 h-4" /> Approve Proposal
+                    </button>
+                  )}
+
+                  {detailEvent.status !== 'Rejected' && !inspectRejectMode && (
+                    <button
+                      onClick={() => setInspectRejectMode(true)}
+                      className="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold uppercase tracking-wider rounded-xl transition-all cursor-pointer flex items-center gap-1.5"
+                    >
+                      <ThumbsDown className="w-4 h-4" /> Reject Proposal
+                    </button>
+                  )}
+
+                  <button
+                    onClick={() => {
+                      setDetailEvent(null);
+                      setInspectRejectMode(false);
+                      setInspectRejectReason('');
+                    }}
+                    className="px-4 py-2 bg-zinc-900 border border-white/5 hover:bg-zinc-800 text-zinc-300 hover:text-white text-xs font-bold uppercase tracking-wider rounded-xl transition-colors cursor-pointer"
+                  >
+                    Close
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* --- PROPORTIONAL VISUAL FOOTER --- */}
       <footer className="mt-auto border-t border-white/5 py-8 bg-zinc-950">
